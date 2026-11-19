@@ -71,12 +71,37 @@ function Get-CleanupSelection {
     if ($Plugins) { Get-CleanupFiles (Join-Path $Root 'XPlugin\Plugins') '微信插件' }
 }
 
-function Test-WeChatRunning {
+function Get-WeChatProcess {
     $names = @('WeChat', 'Weixin', 'WeChatAppEx', 'WeixinAppEx', 'WeChatPlayer', 'WeixinPlayer', 'WeixinUpdate', 'xwechat')
+    $session = [Diagnostics.Process]::GetCurrentProcess().SessionId
     foreach ($process in (Get-Process -ErrorAction Stop)) {
-        if ($process.ProcessName -in $names) { return $true }
+        if ($process.ProcessName -in $names -and $process.SessionId -eq $session) { $process }
     }
-    return $false
+}
+
+function Test-WeChatRunning {
+    @(Get-WeChatProcess).Count -gt 0
+}
+
+function Stop-WeChat {
+    $closeRequested = $false
+    foreach ($process in (Get-WeChatProcess)) {
+        if (-not $process.HasExited -and $process.CloseMainWindow()) { $closeRequested = $true }
+    }
+    if ($closeRequested) { Start-Sleep -Seconds 2 }
+
+    foreach ($process in (Get-WeChatProcess)) {
+        try {
+            if (-not $process.HasExited) { Stop-Process -InputObject $process -ErrorAction Stop }
+        } catch {
+            if (-not $process.HasExited) { throw }
+        }
+    }
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        if (-not (Test-WeChatRunning)) { return }
+        Start-Sleep -Milliseconds 250
+    }
+    throw '微信后台仍在运行。请从系统托盘退出微信后重试。'
 }
 
 function Invoke-Cleanup {
@@ -104,7 +129,19 @@ function Invoke-Cleanup {
     [pscustomobject]@{ Removed = $removed; Bytes = $bytes; Skipped = $Selection.Count - $removed }
 }
 
-if ($MyInvocation.InvocationName -ne '.') {
+function Write-CleanupPreview {
+    param($Selection)
+    Write-Host '清理预览'
+    foreach ($group in ($Selection | Group-Object Category)) {
+        $size = ($group.Group | Measure-Object Bytes -Sum).Sum
+        Write-Host ('{0}  {1} 个文件  {2:N2} MiB' -f $group.Name, $group.Count, ($size / 1MB))
+    }
+    $total = ($Selection | Measure-Object Bytes -Sum).Sum
+    Write-Host ('合计  {0} 个文件  {1:N2} MiB' -f $Selection.Count, ($total / 1MB))
+}
+
+function Invoke-WeChatCleaner {
+    param([string]$Root, [switch]$Preview)
     $ErrorActionPreference = 'Stop'
     try {
         $choice = '1'
@@ -115,34 +152,43 @@ if ($MyInvocation.InvocationName -ne '.') {
             Write-Host '3  日志与缓存 + 微信插件'
             Write-Host '4  日志与缓存 + 小程序安装包 + 微信插件'
             $choice = Read-Host '选择 1 到 4，回车选 1，输入 Q 退出'
-            if ($choice -eq 'Q') { exit 0 }
+            if ($choice -eq 'Q') { return 0 }
             if (-not $choice) { $choice = '1' }
             if ($choice -notin @('1', '2', '3', '4')) { throw '请输入 1 到 4。' }
         }
 
         $packages = $choice -in @('2', '4')
         $plugins = $choice -in @('3', '4')
-        $root = Join-Path $env:APPDATA 'Tencent\xwechat'
-        $selection = @(Get-CleanupSelection -Root $root -Packages:$packages -Plugins:$plugins)
-        Write-Host '清理预览'
-        foreach ($group in ($selection | Group-Object Category)) {
-            $size = ($group.Group | Measure-Object Bytes -Sum).Sum
-            Write-Host ('{0}  {1} 个文件  {2:N2} MiB' -f $group.Name, $group.Count, ($size / 1MB))
+        $selection = @(Get-CleanupSelection -Root $Root -Packages:$packages -Plugins:$plugins)
+        Write-CleanupPreview $selection
+        if ($Preview -or $selection.Count -eq 0) { return 0 }
+        if (Test-WeChatRunning) {
+            Write-Host '检测到微信正在运行。自动退出可能会中断正在进行的操作。'
+            if ((Read-Host '输入 Y 自动退出微信并继续，直接回车取消') -ne 'Y') {
+                Write-Host '已取消。'
+                return 0
+            }
+            Stop-WeChat
+            Write-Host '微信已退出，正在重新扫描。'
+            $selection = @(Get-CleanupSelection -Root $Root -Packages:$packages -Plugins:$plugins)
+            Write-CleanupPreview $selection
+            if ($selection.Count -eq 0) { return 0 }
         }
-        $total = ($selection | Measure-Object Bytes -Sum).Sum
-        Write-Host ('合计  {0} 个文件  {1:N2} MiB' -f $selection.Count, ($total / 1MB))
-        if ($Preview -or $selection.Count -eq 0) { exit 0 }
         if ($packages) { Write-Host '小程序可能需要重新下载安装包。' }
         if ($plugins) { Write-Host 'OCR、播放器等功能可能暂时不可用，恢复取决于微信能否重新下载插件。' }
-        if ((Read-Host '请从系统托盘退出微信。输入 Y 永久删除，直接回车取消') -ne 'Y') {
+        if ((Read-Host '输入 Y 永久删除，直接回车取消') -ne 'Y') {
             Write-Host '已取消。'
-            exit 0
+            return 0
         }
         $result = Invoke-Cleanup $selection
         Write-Host ('已删除 {0} 个文件（{1:N2} MiB），跳过 {2} 个。' -f $result.Removed, ($result.Bytes / 1MB), $result.Skipped)
-        if ($result.Skipped -gt 0) { exit 1 }
+        return [int]($result.Skipped -gt 0)
     } catch {
         Write-Host ("清理中止：{0}" -f $_.Exception.Message)
-        exit 1
+        return 1
     }
+}
+
+if ($MyInvocation.InvocationName -ne '.') {
+    exit (Invoke-WeChatCleaner -Root (Join-Path $env:APPDATA 'Tencent\xwechat') -Preview:$Preview)
 }

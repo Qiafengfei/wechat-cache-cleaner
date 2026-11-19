@@ -62,7 +62,49 @@ try {
         if (-not [IO.File]::Exists((Join-Path $root $relative))) { throw "Cleanup changed $relative" }
     }
     if ([IO.File]::ReadAllText($external) -ne 'keep') { throw 'Cleanup modified an external file.' }
-    Write-Host 'PASS: preview, process guard, default and optional cleanup, junction and hard link protection.'
+
+    $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @(
+        '-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 45'
+    ) -WindowStyle Hidden -PassThru
+    try {
+        & {
+            function Get-WeChatProcess { Get-Process -Id $child.Id -ErrorAction SilentlyContinue }
+            function Test-WeChatRunning { @(Get-WeChatProcess).Count -gt 0 }
+            Stop-WeChat
+        }
+        if (-not $child.WaitForExit(1000)) { throw 'The selected background process did not exit.' }
+    } finally {
+        if (-not $child.HasExited) { $child.Kill() }
+        $child.Dispose()
+    }
+
+    $sample = Join-Path $root $defaults[0]
+    [IO.File]::WriteAllText($sample, 'before exit')
+    $script:running = $true
+    $script:closed = 0
+    $script:answers = [Collections.Generic.Queue[string]]::new()
+    function Test-WeChatRunning { $script:running }
+    function Read-Host { $script:answers.Dequeue() }
+    function Stop-WeChat {
+        $script:closed++
+        $script:running = $false
+        [IO.File]::WriteAllText($sample, 'log flushed on exit')
+    }
+    foreach ($answer in @('1', 'N')) { $script:answers.Enqueue($answer) }
+    if ((Invoke-WeChatCleaner -Root $root) -ne 0 -or $script:closed -ne 0 -or -not [IO.File]::Exists($sample)) {
+        throw 'Declining closure changed the process or files.'
+    }
+    foreach ($answer in @('1', 'Y', 'N')) { $script:answers.Enqueue($answer) }
+    if ((Invoke-WeChatCleaner -Root $root) -ne 0 -or $script:closed -ne 1 -or -not [IO.File]::Exists($sample)) {
+        throw 'Declining deletion failed to preserve files after closure.'
+    }
+    $script:running = $true
+    [IO.File]::WriteAllText($sample, 'before exit')
+    foreach ($answer in @('1', 'Y', 'Y')) { $script:answers.Enqueue($answer) }
+    if ((Invoke-WeChatCleaner -Root $root) -ne 0 -or $script:closed -ne 2 -or [IO.File]::Exists($sample)) {
+        throw 'Confirmed cleanup missed a log changed during closure.'
+    }
+    Write-Host 'PASS: cleanup safety, close confirmation, deletion confirmation, and rescanning after closure.'
 } finally {
     if (Test-Path -LiteralPath $junction) { [IO.Directory]::Delete($junction) }
     if ([IO.Directory]::Exists($fixture)) { [IO.Directory]::Delete($fixture, $true) }
