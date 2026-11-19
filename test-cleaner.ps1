@@ -78,10 +78,24 @@ try {
         $child.Dispose()
     }
 
+    $marker = Join-Path $fixture 'reopened.txt'
+    $shortcutPath = Join-Path $fixture 'test-launch.lnk'
+    $shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = Join-Path $PSHOME 'powershell.exe'
+    $escapedMarker = $marker.Replace("'", "''")
+    $shortcut.Arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -Command `"[IO.File]::WriteAllText('$escapedMarker', 'opened')`""
+    $shortcut.Save()
+    & {
+        function Get-WeChatMainProcess { if ([IO.File]::Exists($marker)) { $true } }
+        Start-WeChat -Path $shortcutPath
+    }
+    if ([IO.File]::ReadAllText($marker) -ne 'opened') { throw 'Native shortcut launch failed.' }
+
     $sample = Join-Path $root $defaults[0]
     [IO.File]::WriteAllText($sample, 'before exit')
     $script:running = $true
     $script:closed = 0
+    $script:reopened = 0
     $script:answers = [Collections.Generic.Queue[string]]::new()
     function Test-WeChatRunning { $script:running }
     function Read-Host { $script:answers.Dequeue() }
@@ -90,21 +104,38 @@ try {
         $script:running = $false
         [IO.File]::WriteAllText($sample, 'log flushed on exit')
     }
+    function Get-WeChatLaunchPath { 'sample-wechat.exe' }
+    function Start-WeChat {
+        param([string]$Path)
+        if ($Path -ne 'sample-wechat.exe' -or $script:running) { throw 'Wrong restart target or timing.' }
+        $script:reopened++
+        $script:running = $true
+    }
     foreach ($answer in @('1', 'N')) { $script:answers.Enqueue($answer) }
-    if ((Invoke-WeChatCleaner -Root $root) -ne 0 -or $script:closed -ne 0 -or -not [IO.File]::Exists($sample)) {
+    if ((Invoke-WeChatCleaner -Root $root) -ne 0 -or $script:closed -ne 0 -or
+        $script:reopened -ne 0 -or -not [IO.File]::Exists($sample)) {
         throw 'Declining closure changed the process or files.'
     }
     foreach ($answer in @('1', 'Y', 'N')) { $script:answers.Enqueue($answer) }
-    if ((Invoke-WeChatCleaner -Root $root) -ne 0 -or $script:closed -ne 1 -or -not [IO.File]::Exists($sample)) {
-        throw 'Declining deletion failed to preserve files after closure.'
+    if ((Invoke-WeChatCleaner -Root $root) -ne 0 -or $script:closed -ne 1 -or
+        $script:reopened -ne 1 -or -not [IO.File]::Exists($sample)) {
+        throw 'Declining deletion did not preserve files and reopen WeChat.'
     }
     $script:running = $true
     [IO.File]::WriteAllText($sample, 'before exit')
     foreach ($answer in @('1', 'Y', 'Y')) { $script:answers.Enqueue($answer) }
-    if ((Invoke-WeChatCleaner -Root $root) -ne 0 -or $script:closed -ne 2 -or [IO.File]::Exists($sample)) {
-        throw 'Confirmed cleanup missed a log changed during closure.'
+    if ((Invoke-WeChatCleaner -Root $root) -ne 0 -or $script:closed -ne 2 -or
+        $script:reopened -ne 2 -or [IO.File]::Exists($sample)) {
+        throw 'Confirmed cleanup did not remove the refreshed log and reopen WeChat.'
     }
-    Write-Host 'PASS: cleanup safety, close confirmation, deletion confirmation, and rescanning after closure.'
+    $script:running = $false
+    [IO.File]::WriteAllText($sample, 'initially closed')
+    foreach ($answer in @('1', 'Y')) { $script:answers.Enqueue($answer) }
+    if ((Invoke-WeChatCleaner -Root $root) -ne 0 -or $script:closed -ne 2 -or
+        $script:reopened -ne 2 -or [IO.File]::Exists($sample)) {
+        throw 'Cleanup started WeChat even though it was initially closed.'
+    }
+    Write-Host 'PASS: cleanup safety, confirmations, rescanning, and restoring the original running state.'
 } finally {
     if (Test-Path -LiteralPath $junction) { [IO.Directory]::Delete($junction) }
     if ([IO.Directory]::Exists($fixture)) { [IO.Directory]::Delete($fixture, $true) }

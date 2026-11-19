@@ -83,6 +83,43 @@ function Test-WeChatRunning {
     @(Get-WeChatProcess).Count -gt 0
 }
 
+function Get-WeChatMainProcess {
+    Get-WeChatProcess | Where-Object { $_.ProcessName -in @('Weixin', 'WeChat') }
+}
+
+function Get-WeChatLaunchPath {
+    foreach ($process in (Get-WeChatMainProcess)) {
+        if ($process.Path -and (Test-Path -LiteralPath $process.Path -PathType Leaf)) {
+            return $process.Path
+        }
+    }
+    foreach ($folder in @('Programs', 'CommonPrograms')) {
+        $directory = [Environment]::GetFolderPath($folder)
+        if (-not $directory) { continue }
+        $shortcut = Get-ChildItem -LiteralPath $directory -File -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.BaseName -in @('微信', 'Weixin', 'WeChat') } |
+            Select-Object -First 1
+        if ($shortcut) { return $shortcut.FullName }
+    }
+}
+
+function Start-WeChat {
+    param([string]$Path)
+    if (Get-WeChatMainProcess) {
+        Write-Host '微信已在运行。'
+        return
+    }
+    Start-Process -FilePath $Path -WorkingDirectory ([IO.Path]::GetDirectoryName($Path)) -ErrorAction Stop
+    for ($attempt = 0; $attempt -lt 32; $attempt++) {
+        if (Get-WeChatMainProcess) {
+            Write-Host '已重新打开微信。'
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    throw '已请求启动，但暂未检测到微信进程。'
+}
+
 function Stop-WeChat {
     $closeRequested = $false
     foreach ($process in (Get-WeChatProcess)) {
@@ -143,6 +180,7 @@ function Write-CleanupPreview {
 function Invoke-WeChatCleaner {
     param([string]$Root, [switch]$Preview)
     $ErrorActionPreference = 'Stop'
+    $restartPath = $null
     try {
         $choice = '1'
         if (-not $Preview) {
@@ -168,11 +206,15 @@ function Invoke-WeChatCleaner {
                 Write-Host '已取消。'
                 return 0
             }
-            Stop-WeChat
-            Write-Host '微信已退出，正在重新扫描。'
-            $selection = @(Get-CleanupSelection -Root $Root -Packages:$packages -Plugins:$plugins)
-            Write-CleanupPreview $selection
-            if ($selection.Count -eq 0) { return 0 }
+            if (Test-WeChatRunning) {
+                $restartPath = Get-WeChatLaunchPath
+                if (-not $restartPath) { throw '找不到微信启动入口。请手动退出微信后重试。' }
+                Stop-WeChat
+                Write-Host '微信已退出，正在重新扫描。'
+                $selection = @(Get-CleanupSelection -Root $Root -Packages:$packages -Plugins:$plugins)
+                Write-CleanupPreview $selection
+                if ($selection.Count -eq 0) { return 0 }
+            }
         }
         if ($packages) { Write-Host '小程序可能需要重新下载安装包。' }
         if ($plugins) { Write-Host 'OCR、播放器等功能可能暂时不可用，恢复取决于微信能否重新下载插件。' }
@@ -186,6 +228,14 @@ function Invoke-WeChatCleaner {
     } catch {
         Write-Host ("清理中止：{0}" -f $_.Exception.Message)
         return 1
+    } finally {
+        if ($restartPath) {
+            try {
+                Start-WeChat -Path $restartPath
+            } catch {
+                Write-Warning ("无法确认微信已重新打开，请从开始菜单打开微信。{0}" -f $_.Exception.Message)
+            }
+        }
     }
 }
 
